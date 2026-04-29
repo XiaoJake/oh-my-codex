@@ -274,6 +274,10 @@ export function autoStartStdioMcpServer(
     : null;
   duplicateSiblingWatchdog?.unref();
 
+  // Keep the stdio server alive even if the client half-closes stdin early.
+  // We rely on transport_close / parent_gone for actual lifecycle shutdown.
+  const livenessKeepalive = setInterval(() => {}, 60_000);
+
   const shutdown = async (reason: string) => {
     if (shuttingDown) {
       return;
@@ -286,6 +290,7 @@ export function autoStartStdioMcpServer(
     if (duplicateSiblingWatchdog) {
       clearInterval(duplicateSiblingWatchdog);
     }
+    clearInterval(livenessKeepalive);
     process.stdin.off('data', handleStdinData);
     process.stdin.off('end', handleStdinEnd);
     process.stdin.off('close', handleStdinClose);
@@ -303,10 +308,10 @@ export function autoStartStdioMcpServer(
   };
 
   const handleStdinEnd = () => {
-    void shutdown('stdin_end');
+    logLifecycle('transport observed stdin_end; waiting for transport_close or parent_gone');
   };
   const handleStdinClose = () => {
-    void shutdown('stdin_close');
+    logLifecycle('transport observed stdin_close; waiting for transport_close or parent_gone');
   };
   const handleStdinData = () => {
     lastTrafficAtMs = Date.now();
@@ -318,6 +323,7 @@ export function autoStartStdioMcpServer(
     void shutdown('sigint');
   };
 
+  process.stdin.resume();
   process.stdin.on('data', handleStdinData);
   process.stdin.once('end', handleStdinEnd);
   process.stdin.once('close', handleStdinClose);
@@ -331,6 +337,7 @@ export function autoStartStdioMcpServer(
 
   server.connect(transport).catch((error) => {
     logLifecycle('server.connect failed', error);
+    clearInterval(livenessKeepalive);
     process.stdin.off('data', handleStdinData);
     process.stdin.off('end', handleStdinEnd);
     process.stdin.off('close', handleStdinClose);
