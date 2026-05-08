@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
-import { join } from 'path';
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
+import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import {
+  DEFAULT_MAX_WORKERS,
   initTeamState,
   createTask,
   writeWorkerIdentity,
+  writeWorkerInbox,
   readTeamConfig,
   saveTeamConfig,
   listMailboxMessages,
@@ -36,12 +39,21 @@ import {
   shouldPrekillInteractiveShutdownProcessTrees,
   waitForWorkerStartupEvidence,
   waitForClaudeStartupEvidence,
+  cleanupTeamWorkerLaunchOrphanedMcpProcesses,
+  settleStartupAttemptResults,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
   type TeamRuntime,
 } from '../runtime.js';
-import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
+import { resolveAgentReasoningEffort, resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
 import { readTeamEvents } from '../state/events.js';
 import { sanitizeTeamName } from '../tmux-session.js';
+import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
+import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
+
+const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
+const skipSlowLifecycleUnderCoverage = coverageRun
+  ? 'covered by the team-state-runtime lane; skipped under c8 to keep the coverage gate bounded around slow process-lifecycle waits'
+  : false;
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-worktree-repo-'));
@@ -58,6 +70,54 @@ async function addWorktree(repo: string, branchName: string, pathPrefix: string)
   const worktreePath = await mkdtemp(join(tmpdir(), pathPrefix));
   execFileSync('git', ['worktree', 'add', '-b', branchName, worktreePath, 'HEAD'], { cwd: repo, stdio: 'ignore' });
   return worktreePath;
+}
+
+function computeGitBlobSha1(content: string): string {
+  const buffer = Buffer.from(content, 'utf-8');
+  const header = Buffer.from(`blob ${buffer.length}\0`, 'utf-8');
+  return createHash('sha1').update(header).update(buffer).digest('hex');
+}
+
+function canonicalContextPackRelativePath(slug: string): string {
+  return `.omx/context/context-20260507T120000Z-${slug}.json`;
+}
+
+function buildContextPackOutcome(relativePackPath: string): string {
+  return [
+    '## Context Pack Outcome',
+    '',
+    `- pack: created \`${relativePackPath}\``,
+  ].join('\n');
+}
+
+async function writeReadyContextPack(
+  cwd: string,
+  slug: string,
+  prdPath: string,
+  testSpecPath: string,
+): Promise<void> {
+  const contextDir = join(cwd, '.omx', 'context');
+  const packPath = join(cwd, canonicalContextPackRelativePath(slug));
+  const prdContent = await readFile(prdPath, 'utf-8');
+  const testSpecContent = await readFile(testSpecPath, 'utf-8');
+  await mkdir(contextDir, { recursive: true });
+  await writeFile(packPath, JSON.stringify({
+    slug,
+    basis: {
+      prd: {
+        path: relative(cwd, prdPath).replaceAll('\\', '/'),
+        sha1: computeGitBlobSha1(prdContent),
+      },
+      testSpecs: [{
+        path: relative(cwd, testSpecPath).replaceAll('\\', '/'),
+        sha1: computeGitBlobSha1(testSpecContent),
+      }],
+    },
+    entries: ['scope', 'build', 'verify'].map((role, index) => ({
+      path: `src/${role}-${index}.ts`,
+      roles: [role],
+    })),
+  }, null, 2));
 }
 
 async function attachDirtyWorkerRepo(teamName: string, cwd: string, repoName: string): Promise<void> {
@@ -84,6 +144,64 @@ function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
 }
 
+function withIsolatedDefaultModelEnv<T>(run: () => T): T {
+  const savedEnv = new Map<string, string | undefined>();
+  for (const key of [
+    'CODEX_HOME',
+    'OMX_DEFAULT_FRONTIER_MODEL',
+    'OMX_DEFAULT_STANDARD_MODEL',
+    'OMX_DEFAULT_SPARK_MODEL',
+    'OMX_SPARK_MODEL',
+    'OMX_TEAM_WORKER_LAUNCH_ARGS',
+  ] as const) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  process.env.CODEX_HOME = join(
+    tmpdir(),
+    `omx-runtime-defaults-${process.pid}-${Date.now()}`,
+  );
+
+  try {
+    return run();
+  } finally {
+    for (const [key, value] of savedEnv.entries()) {
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  }
+}
+
+async function withIsolatedDefaultModelEnvAsync<T>(
+  run: () => Promise<T>,
+): Promise<T> {
+  const savedEnv = new Map<string, string | undefined>();
+  for (const key of [
+    'CODEX_HOME',
+    'OMX_DEFAULT_FRONTIER_MODEL',
+    'OMX_DEFAULT_STANDARD_MODEL',
+    'OMX_DEFAULT_SPARK_MODEL',
+    'OMX_SPARK_MODEL',
+    'OMX_TEAM_WORKER_LAUNCH_ARGS',
+  ] as const) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  process.env.CODEX_HOME = join(
+    tmpdir(),
+    `omx-runtime-defaults-${process.pid}-${Date.now()}`,
+  );
+
+  try {
+    return await run();
+  } finally {
+    for (const [key, value] of savedEnv.entries()) {
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  }
+}
+
 async function readTeamDeliveryLog(cwd: string): Promise<Array<Record<string, unknown>>> {
   const path = join(cwd, '.omx', 'logs', `team-delivery-${new Date().toISOString().slice(0, 10)}.jsonl`);
   const raw = await readFile(path, 'utf-8').catch(() => '');
@@ -92,6 +210,65 @@ async function readTeamDeliveryLog(cwd: string): Promise<Array<Record<string, un
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function markPendingInboxDispatchesDelivered(
+  teamName: string,
+  cwd: string,
+  opts: {
+    toWorker?: string;
+    lastReason?: string;
+    beforeDeliver?: () => Promise<void>;
+    afterDeliver?: () => Promise<void>;
+  } = {},
+): Promise<void> {
+  const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
+  for (const request of requests) {
+    if (request.status !== 'pending') continue;
+    if (opts.toWorker && request.to_worker !== opts.toWorker) continue;
+    await opts.beforeDeliver?.();
+    const notified = await transitionDispatchRequest(
+      teamName,
+      request.request_id,
+      'pending',
+      'notified',
+      { last_reason: opts.lastReason ?? 'test_delivered_receipt' },
+      cwd,
+    ).catch(() => null);
+    if (!notified) continue;
+    await transitionDispatchRequest(
+      teamName,
+      request.request_id,
+      'notified',
+      'delivered',
+      { last_reason: opts.lastReason ?? 'test_delivered_receipt' },
+      cwd,
+    ).catch(() => {});
+    await opts.afterDeliver?.();
+  }
+}
+
+async function markPendingInboxDispatchesNotified(
+  teamName: string,
+  cwd: string,
+  opts: {
+    toWorker?: string;
+    lastReason?: string;
+  } = {},
+): Promise<void> {
+  const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
+  for (const request of requests) {
+    if (request.status !== 'pending') continue;
+    if (opts.toWorker && request.to_worker !== opts.toWorker) continue;
+    await transitionDispatchRequest(
+      teamName,
+      request.request_id,
+      'pending',
+      'notified',
+      { last_reason: opts.lastReason ?? 'test_notified_receipt' },
+      cwd,
+    ).catch(() => {});
+  }
 }
 
 function withEmptyPath<T>(fn: () => T): T {
@@ -174,6 +351,17 @@ async function waitForFileText(
   throw new Error(`timed out waiting for ${filePath}`);
 }
 
+async function resolveRuntimeTeamName(cwd: string, requestedName: string): Promise<string> {
+  const teamsRoot = join(cwd, '.omx', 'state', 'team');
+  const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
+  const prefix = requestedName.slice(0, 18);
+  const names = entries
+    .filter((entry) => entry.isDirectory() && (entry.name === requestedName || entry.name.startsWith(`${requestedName}-`) || entry.name.startsWith(prefix)))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.length - b.length || a.localeCompare(b));
+  return names[0] ?? requestedName;
+}
+
 async function writeFakePromptWorkerBinary(
   binaryPath: string,
   scriptBody: string,
@@ -185,7 +373,7 @@ async function writeFakePromptWorkerBinary(
 const fs = require('fs');
 const path = require('path');
 const stateRoot = process.env.OMX_TEAM_STATE_ROOT;
-const worker = String(process.env.OMX_TEAM_WORKER || '');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
 const [teamName, workerName] = worker.split('/');
 if (stateRoot && teamName && workerName) {
   const workerDir = path.join(stateRoot, 'team', teamName, 'workers', workerName);
@@ -348,32 +536,49 @@ describe('runtime', () => {
   });
 
   it('resolveWorkerLaunchArgsFromEnv reads low-complexity model from config when present', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const tempCodexHome = await mkdtemp(join(tmpdir(), 'omx-codex-home-'));
-    await writeFile(
-      join(tempCodexHome, '.omx-config.json'),
-      JSON.stringify({ models: { team_low_complexity: 'gpt-4.1-mini' } }),
-    );
-    process.env.CODEX_HOME = tempCodexHome;
-    try {
-      const args = resolveWorkerLaunchArgsFromEnv(
-        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
-        'explore',
+    await withIsolatedDefaultModelEnvAsync(async () => {
+      const previousCodexHome = process.env.CODEX_HOME;
+      const tempCodexHome = await mkdtemp(join(tmpdir(), 'omx-codex-home-'));
+      await writeFile(
+        join(tempCodexHome, '.omx-config.json'),
+        JSON.stringify({ models: { team_low_complexity: 'gpt-4.1-mini' } }),
       );
-      assert.deepEqual(args, ['--no-alt-screen', '--model', 'gpt-4.1-mini']);
-    } finally {
-      if (typeof previousCodexHome === 'string') process.env.CODEX_HOME = previousCodexHome;
-      else delete process.env.CODEX_HOME;
-      await rm(tempCodexHome, { recursive: true, force: true });
-    }
+      process.env.CODEX_HOME = tempCodexHome;
+      try {
+        const args = resolveWorkerLaunchArgsFromEnv(
+          { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+          'explore',
+        );
+        assert.deepEqual(args, ['--no-alt-screen', '--model', 'gpt-4.1-mini']);
+      } finally {
+        if (typeof previousCodexHome === 'string') process.env.CODEX_HOME = previousCodexHome;
+        else delete process.env.CODEX_HOME;
+        await rm(tempCodexHome, { recursive: true, force: true });
+      }
+    });
   });
 
   it('resolveWorkerLaunchArgsFromEnv injects the frontier default model for executor workers', () => {
-    const args = resolveWorkerLaunchArgsFromEnv(
-      { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
-      'executor',
-    );
-    assert.deepEqual(args, ['--no-alt-screen', '--model', 'gpt-5.4']);
+    withIsolatedDefaultModelEnv(() => {
+      const args = resolveWorkerLaunchArgsFromEnv(
+        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+        'executor',
+      );
+      assert.deepEqual(args, ['--no-alt-screen', '--model', 'gpt-5.5']);
+    });
+  });
+
+  it('resolveWorkerLaunchArgsFromEnv uses medium reasoning for executor launch defaults', () => {
+    withIsolatedDefaultModelEnv(() => {
+      const args = resolveWorkerLaunchArgsFromEnv(
+        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+        'executor',
+        undefined,
+        resolveAgentReasoningEffort('executor'),
+        'codex',
+      );
+      assert.deepEqual(args, ['--no-alt-screen', '-c', 'model_reasoning_effort="medium"', '--model', 'gpt-5.5']);
+    });
   });
 
   it('resolveWorkerLaunchArgsFromEnv treats *-low aliases as low complexity', () => {
@@ -425,22 +630,24 @@ describe('runtime', () => {
     const originalLog = console.log;
     console.log = (...args: unknown[]) => { logs.push(args.join(' ')); };
     try {
-      const lowArgs = resolveWorkerLaunchArgsFromEnv(
-        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
-        'executor',
-        undefined,
-        'low',
-        'codex',
-      );
-      const highArgs = resolveWorkerLaunchArgsFromEnv(
-        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
-        'executor',
-        undefined,
-        'high',
-        'codex',
-      );
-      assert.deepEqual(lowArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="low"', '--model', 'gpt-5.4']);
-      assert.deepEqual(highArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="high"', '--model', 'gpt-5.4']);
+      withIsolatedDefaultModelEnv(() => {
+        const lowArgs = resolveWorkerLaunchArgsFromEnv(
+          { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+          'executor',
+          undefined,
+          'low',
+          'codex',
+        );
+        const highArgs = resolveWorkerLaunchArgsFromEnv(
+          { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+          'executor',
+          undefined,
+          'high',
+          'codex',
+        );
+        assert.deepEqual(lowArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="low"', '--model', 'gpt-5.5']);
+        assert.deepEqual(highArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="high"', '--model', 'gpt-5.5']);
+      });
     } finally {
       console.log = originalLog;
     }
@@ -540,13 +747,16 @@ describe('runtime', () => {
     const originalLog = console.log;
     console.log = (...args: unknown[]) => { logs.push(args.join(' ')); };
     try {
-      const codexArgs = resolveWorkerLaunchArgsFromEnv(
-        { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
-        'executor',
-        undefined,
-        'high',
-        'codex',
-      );
+      let codexArgs: string[] = [];
+      withIsolatedDefaultModelEnv(() => {
+        codexArgs = resolveWorkerLaunchArgsFromEnv(
+          { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
+          'executor',
+          undefined,
+          'high',
+          'codex',
+        );
+      });
       const claudeArgs = resolveWorkerLaunchArgsFromEnv(
         { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen --model claude-3-7-sonnet' },
         'executor',
@@ -561,7 +771,7 @@ describe('runtime', () => {
         'low',
         'gemini',
       );
-      assert.deepEqual(codexArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="high"', '--model', 'gpt-5.4']);
+      assert.deepEqual(codexArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="high"', '--model', 'gpt-5.5']);
       assert.deepEqual(claudeArgs, ['--no-alt-screen', '-c', 'model_reasoning_effort="low"', '--model', 'claude-3-7-sonnet']);
       assert.deepEqual(geminiArgs, ['-c', 'model_reasoning_effort="low"', '--model', 'gemini-2.0-pro']);
     } finally {
@@ -660,6 +870,34 @@ describe('runtime', () => {
     }
   });
 
+  it('cleanupTeamWorkerLaunchOrphanedMcpProcesses keeps ps and cleanup failures non-fatal', async () => {
+    const warnings: string[] = [];
+    let calls = 0;
+
+    await cleanupTeamWorkerLaunchOrphanedMcpProcesses({
+      cleanup: async () => {
+        calls += 1;
+        throw new Error('ps unavailable');
+      },
+      writeWarning: (message) => warnings.push(message),
+    });
+
+    await cleanupTeamWorkerLaunchOrphanedMcpProcesses({
+      cleanup: async () => ({
+        dryRun: false,
+        candidates: [],
+        terminatedCount: 0,
+        forceKilledCount: 0,
+        failedPids: [1234],
+      }),
+      writeWarning: (message) => warnings.push(message),
+    });
+
+    assert.equal(calls, 1);
+    assert.match(warnings.join('\n'), /ps unavailable.*continuing worker launch/);
+    assert.match(warnings.join('\n'), /Failed to reap 1 orphaned OMX MCP process/);
+  });
+
   it('waitForWorkerStartupEvidence treats blocked worker status as settled progress even without a claimed task id', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-codex-blocked-startup-'));
     try {
@@ -687,13 +925,184 @@ describe('runtime', () => {
     }
   });
 
-  it('startTeam rejects interactive startup when tmux fallback never produces worker startup evidence', async () => {
+  it(
+    'uses a production startup evidence window that can tolerate slow Codex startup',
+    { skip: skipSlowLifecycleUnderCoverage },
+    async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-window-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
+    const prevStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const prevStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const prevStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+    let receiptNotifier: NodeJS.Timeout | null = null;
+    let progressWriter: NodeJS.Timeout | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-startup-window-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%1\\tzsh\\tzsh\\n"
+        exit 0
+        ;;
+      *"#{pane_pid}"*)
+        echo "4321"
+        exit 0
+        ;;
+      *"#{pane_dead} #{pane_pid}"*)
+        echo "0 4321"
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    printf 'OpenAI Codex\\n> '
+    exit 0
+    ;;
+  send-keys|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [
+            {
+              name: 'codex',
+              content: '#!/bin/sh\nsleep 30\n',
+            },
+          ],
+        },
+        async () => {
+          process.env.TMUX = 'leader-session';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
+          delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+          const expectedTeamName = buildInternalTeamName('team-startup-window', resolveTeamIdentityScope(process.env));
+
+          receiptNotifier = setInterval(() => {
+            void markPendingInboxDispatchesNotified(expectedTeamName, cwd, {
+              toWorker: 'worker-1',
+              lastReason: 'test_notified_receipt',
+            }).catch(() => {});
+          }, 20);
+
+          progressWriter = setTimeout(() => {
+            void writeWorkerStatus(
+              expectedTeamName,
+              'worker-1',
+              {
+                state: 'working',
+                current_task_id: '1',
+                updated_at: new Date().toISOString(),
+              },
+              cwd,
+            ).catch(() => {});
+          }, 6_000);
+
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-startup-window',
+              'interactive startup should wait for slow Codex evidence',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+            ));
+
+          assert.equal(runtime.teamName, expectedTeamName);
+          assert.ok(await readTeamConfig(runtime.teamName, cwd));
+        },
+      );
+    } finally {
+      if (receiptNotifier) clearInterval(receiptNotifier);
+      if (progressWriter) clearTimeout(progressWriter);
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevSkipReadyWait === 'string') process.env.OMX_TEAM_SKIP_READY_WAIT = prevSkipReadyWait;
+      else delete process.env.OMX_TEAM_SKIP_READY_WAIT;
+      if (typeof prevStartupEvidenceTimeout === 'string') {
+        process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = prevStartupEvidenceTimeout;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      }
+      if (typeof prevStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = prevStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof prevStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = prevStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'startTeam records recoverable issue when tmux fallback never produces worker startup evidence',
+    { skip: skipSlowLifecycleUnderCoverage },
+    async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-no-evidence-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const prevSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
+    const prevStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const prevStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const prevStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
     let receiptFailer: NodeJS.Timeout | null = null;
 
     try {
@@ -774,18 +1183,22 @@ esac
           process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
           process.env.OMX_TEAM_WORKER_CLI = 'codex';
           process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
+          process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+          const expectedTeamName = buildInternalTeamName('team-startup-no-evidence', resolveTeamIdentityScope(process.env));
 
           receiptFailer = setInterval(() => {
             void (async () => {
               const requests = await listDispatchRequests(
-                'team-startup-no-evidence',
+                expectedTeamName,
                 cwd,
                 { kind: 'inbox' },
               ).catch(() => []);
               for (const request of requests) {
                 if (request.status !== 'pending') continue;
                 await transitionDispatchRequest(
-                  'team-startup-no-evidence',
+                  expectedTeamName,
                   request.request_id,
                   'pending',
                   'failed',
@@ -796,28 +1209,29 @@ esac
             })();
           }, 20);
 
-          await assert.rejects(
-            () => withoutTeamWorkerEnv(() =>
-              startTeam(
-                'team-startup-no-evidence',
-                'interactive startup must observe worker evidence',
-                'executor',
-                1,
-                [{ subject: 's', description: 'd', owner: 'worker-1' }],
-                cwd,
-              )),
-            /worker_notify_failed/,
-          );
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-startup-no-evidence',
+              'interactive startup records missing worker evidence without aborting live panes',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+            ));
 
           if (receiptFailer) {
             clearInterval(receiptFailer);
             receiptFailer = null;
           }
 
-          assert.equal(await readTeamConfig('team-startup-no-evidence', cwd), null);
+          assert.ok(await readTeamConfig(runtime.teamName, cwd));
+          const workerStatus = await readWorkerStatus(runtime.teamName, 'worker-1', cwd);
+          assert.ok(['unknown', 'idle'].includes(workerStatus.state));
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /send-keys -t %2 -l --/);
+
+          await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
         },
       );
     } finally {
@@ -832,6 +1246,21 @@ esac
       else delete process.env.OMX_TEAM_WORKER_CLI;
       if (typeof prevSkipReadyWait === 'string') process.env.OMX_TEAM_SKIP_READY_WAIT = prevSkipReadyWait;
       else delete process.env.OMX_TEAM_SKIP_READY_WAIT;
+      if (typeof prevStartupEvidenceTimeout === 'string') {
+        process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = prevStartupEvidenceTimeout;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      }
+      if (typeof prevStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = prevStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof prevStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = prevStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -913,7 +1342,8 @@ sleep 5
         [{ subject: 's', description: 'd', owner: 'worker-1' }],
         cwd,
       );
-      assert.equal(runtime.teamName, 'nested-allowed');
+      assert.match(runtime.teamName, /^nested-allowed-[a-f0-9]{8}$/);
+      assert.equal(runtime.config.display_name, 'nested-allowed');
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
     } finally {
@@ -933,8 +1363,6 @@ sleep 5
       else delete process.env.OMX_TEAM_LEADER_CWD;
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
-      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
-      else delete process.env.OMX_TEAM_WORKER_CLI;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -954,6 +1382,93 @@ sleep 5
     } finally {
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('shutdownTeam with path-like display input cannot remove state outside the team directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unsafe-'));
+    try {
+      const victim = join(cwd, '.omx', 'state', 'victim');
+      await mkdir(victim, { recursive: true });
+      await writeFile(join(victim, 'keep.txt'), 'keep');
+
+      await shutdownTeam('../../victim', cwd, { force: true });
+      assert.equal(existsSync(join(victim, 'keep.txt')), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam blocks duplicate no-session/no-tmux prompt-mode starts with stable cwd leader identity', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-duplicate-nosession-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);
+process.on('SIGTERM', () => process.exit(0));`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      await withPromptModeCodexEnv(
+        binDir,
+        {
+          OMX_SESSION_ID: undefined,
+          CODEX_SESSION_ID: undefined,
+          SESSION_ID: undefined,
+          TMUX_PANE: undefined,
+        },
+        async () => {
+          runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'first-prompt-team',
+              'first no-session prompt team',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+            ));
+
+          assert.equal(runtime.config.worker_launch_mode, 'prompt');
+          assert.match(runtime.teamName, /^first-prompt-team-[a-f0-9]{8}$/);
+          assert.equal(runtime.config.display_name, 'first-prompt-team');
+          assert.equal(runtime.config.identity_source, 'run-id');
+          const manifest = JSON.parse(
+            await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'manifest.v2.json'), 'utf-8'),
+          ) as { leader?: { session_id?: string } };
+          assert.equal(manifest.leader?.session_id, `cwd:${cwd}`);
+
+          await assert.rejects(
+            () => withoutTeamWorkerEnv(() =>
+              startTeam(
+                'second-prompt-team',
+                'second no-session prompt team must be blocked',
+                'executor',
+                1,
+                [{ subject: 's2', description: 'd2', owner: 'worker-1' }],
+                cwd,
+              )),
+            /leader_session_conflict: active team exists \(first-prompt-team-[a-f0-9]{8}\)/,
+          );
+
+          const teamEntries = await readdir(join(cwd, '.omx', 'state', 'team'), { withFileTypes: true });
+          assert.equal(
+            teamEntries.some((entry) => entry.isDirectory() && entry.name.startsWith('second-prompt-team-')),
+            false,
+            'blocked duplicate start must not create a second prompt-mode team state directory',
+          );
+        },
+      );
+    } finally {
+      const runtimeToShutdown = runtime as TeamRuntime | null;
+      if (runtimeToShutdown) {
+        await shutdownTeam(runtimeToShutdown.teamName, cwd, { force: true }).catch(() => {});
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -1062,7 +1577,14 @@ case "\${1:-}" in
     exit 0
     ;;
   list-panes)
-    printf "%%1\\tnode\\t'codex'\\n"
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n%%3\\tnode\\t'node omx hud --watch'\\n"
+        ;;
+      *)
+        printf "%%1\\n%%2\\n%%3\\n"
+        ;;
+    esac
     exit 0
     ;;
   split-window)
@@ -1101,7 +1623,7 @@ esac
           delete process.env.WSL_INTEROP;
           Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
-          runtime = await withoutTeamWorkerEnv(() =>
+          const runtime = await withoutTeamWorkerEnv(() =>
             startTeam(
               'team-win32-no-env',
               'native windows current-client detection',
@@ -1122,7 +1644,6 @@ esac
           if (teamNameForCleanup) {
             await shutdownTeam(teamNameForCleanup, cwd, { force: true });
           }
-          runtime = null;
         },
       );
     } finally {
@@ -1175,6 +1696,121 @@ esac
       assert.equal(config.workers[0]?.pane_id, '%2');
       assert.equal(config.workers[1]?.pane_id, '%3');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam runs worker MCP orphan cleanup before interactive tmux worker spawn', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-interactive-mcp-cleanup-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
+    let runtime: TeamRuntime | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-interactive-mcp-cleanup-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "1 999999" ;;
+      *"-t %2"*"#{pane_pid}"*) echo "2222" ;;
+      *"#{pane_pid}"*) echo "1111" ;;
+      *) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        team_dir=$(find "${cwd}/.omx/state/team" -maxdepth 1 -type d -name 'team-interactive*' | head -n 1)
+        mkdir -p "$team_dir/workers/worker-1"
+        cat > "$team_dir/workers/worker-1/status.json" <<'EOF'
+{
+  "state": "working",
+  "current_task_id": "1",
+  "updated_at": "2026-04-23T00:00:00.000Z"
+}
+EOF
+        echo "%2"
+        ;;
+      *) echo "%3" ;;
+    esac
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: '#!/bin/sh\nexit 0\n' }],
+        },
+        async ({ tmuxLogPath }) => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
+
+          const events: string[] = [];
+          runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-interactive-cleanup',
+              'interactive cleanup before worker spawn',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                cleanupLaunchOrphanedMcpProcesses: async () => {
+                  events.push('cleanup');
+                  return { dryRun: false, candidates: [], terminatedCount: 0, forceKilledCount: 0, failedPids: [] };
+                },
+              },
+            ));
+
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.match(tmuxLog, /split-window/);
+          assert.deepEqual(events, ['cleanup']);
+          assert.equal(runtime.config.workers[0]?.pane_id, '%2');
+        },
+      );
+    } finally {
+      const runtimeToShutdown = runtime as TeamRuntime | null;
+      if (runtimeToShutdown) {
+        await shutdownTeam(runtimeToShutdown.teamName, cwd, { force: true }).catch(() => {});
+      }
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevSkipReadyWait === 'string') process.env.OMX_TEAM_SKIP_READY_WAIT = prevSkipReadyWait;
+      else delete process.env.OMX_TEAM_SKIP_READY_WAIT;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -1237,8 +1873,9 @@ case "\${1:-}" in
   split-window)
     case "$*" in
       *" -h "*)
-        mkdir -p "${cwd}/.omx/state/team/team-pane-pid/workers/worker-1"
-        cat > "${cwd}/.omx/state/team/team-pane-pid/workers/worker-1/status.json" <<'EOF'
+        team_dir=$(find "${cwd}/.omx/state/team" -maxdepth 1 -type d -name 'team-pane-pid*' | head -n 1)
+        mkdir -p "$team_dir/workers/worker-1"
+        cat > "$team_dir/workers/worker-1/status.json" <<'EOF'
 {
   "state": "working",
   "current_task_id": "1",
@@ -1308,13 +1945,13 @@ esac
     }
   });
 
-  it('startTeam saves interactive pane ids before readiness waits in source order', async () => {
+  it('startTeam saves interactive pane ids before concurrent readiness attempts', async () => {
     const source = await readFile(join(process.cwd(), 'src', 'team', 'runtime.ts'), 'utf-8');
     const applyMatch = source.match(
       /applyCreatedInteractiveSessionToConfig\(\s*config,\s*createdSession,\s*workerPaneIds\s*\);/m,
     );
     const saveMatch = source.match(/await saveTeamConfig\(config, leaderCwd\);/m);
-    const readyMatch = source.match(/const ready = waitForWorkerReady\(/m);
+    const readyMatch = source.match(/waitForWorkerReadyAsync\(/m);
 
     const applyIndex = applyMatch?.index ?? -1;
     const saveIndex = saveMatch?.index ?? -1;
@@ -1327,7 +1964,409 @@ esac
     assert.equal(saveIndex < readyIndex, true);
   });
 
-  it('startTeam records recoverable startup issues per worker instead of failing launch early when panes stay alive', async () => {
+
+  it('startTeam sends startup direct trigger before slow readiness wait when pane is safe', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-direct-fast-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousReadyTimeout = process.env.OMX_TEAM_READY_TIMEOUT_MS;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    let runtimeTeamName: string | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-startup-direct-fast-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+order_file="${cwd}/startup-order.log"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 4242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
+      *"#{pane_pid}"*) echo "4242" ;;
+      *) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    printf '%s\n' capture >> "$order_file"
+    printf 'OpenAI Codex\nmodel: test\ndirectory: /tmp/demo\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' send-keys >> "$order_file"
+    exit 0
+    ;;
+  split-window)
+    echo "%2"
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: '#!/usr/bin/env node\nprocess.stdin.resume();\n' }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_READY_TIMEOUT_MS = '5000';
+          process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '50';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-startup-direct-fast',
+              'startup direct trigger falls back to evidence-gated dispatch',
+              'executor',
+              1,
+              [{ subject: 'w1', description: 'worker one', owner: 'worker-1' }],
+              cwd,
+            ));
+          runtimeTeamName = runtime.teamName;
+
+          const order = (await readFile(join(cwd, 'startup-order.log'), 'utf-8')).trim().split('\n');
+          assert.ok(order.includes('send-keys'), `expected direct send-keys, got ${order.join(',')}`);
+
+          const timing = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'startup-timing.json'), 'utf-8')) as { events: Array<{ phase: string; reason?: string; ok?: boolean }> };
+          assert.ok(timing.events.some((event) => event.phase === 'split_returned'));
+          assert.ok(timing.events.some((event) => event.phase === 'identity_inbox_written'));
+          assert.ok(timing.events.some((event) => event.phase === 'direct_fallback' && /startup_direct_trigger_sent/.test(event.reason ?? '')));
+          assert.ok(timing.events.some((event) => event.phase === 'startup_evidence' && event.reason === 'none' && event.ok === false));
+          assert.equal(timing.events.some((event) => event.phase === 'ready_wait_start'), false);
+          const workerStatus = await readWorkerStatus(runtime.teamName, 'worker-1', cwd);
+          assert.equal(workerStatus?.state, 'unknown');
+          assert.match(workerStatus?.reason ?? '', /startup_direct_no_evidence/);
+        },
+      );
+    } finally {
+      if (runtimeTeamName) await shutdownTeam(runtimeTeamName, cwd, { force: true }).catch(() => {});
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousReadyTimeout === 'string') process.env.OMX_TEAM_READY_TIMEOUT_MS = previousReadyTimeout;
+      else delete process.env.OMX_TEAM_READY_TIMEOUT_MS;
+      if (typeof previousStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      if (typeof previousStartupDispatchRetries === 'string') process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      else delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam treats a confirmed ready prompt as startup evidence after hook notification', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ready-prompt-evidence-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousReadyTimeout = process.env.OMX_TEAM_READY_TIMEOUT_MS;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    let receiptNotifier: NodeJS.Timeout | null = null;
+    let runtimeTeamName: string | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-ready-prompt-evidence-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+count_file="${cwd}/capture-count"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 4242" ;;
+      *"-t %2"*"#{pane_pid}"*) echo "4242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
+      *"#{pane_pid}"*) echo "4242" ;;
+      *) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    count=0
+    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    if [ "$count" -eq 1 ]; then
+      printf 'OpenAI Codex\nmodel: loading\nLoading workspace...\n'
+    else
+      printf 'OpenAI Codex\nmodel: test\n› \n'
+    fi
+    exit 0
+    ;;
+  split-window)
+    echo "%2"
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: '#!/usr/bin/env node\nprocess.stdin.resume();\n' }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_READY_TIMEOUT_MS = '5000';
+          process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+
+          receiptNotifier = setInterval(() => {
+            void markPendingInboxDispatchesNotified('team-ready-prompt-evidence', cwd);
+          }, 20);
+
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-ready-prompt-evidence',
+              'interactive ready prompt should settle startup evidence after notification',
+              'executor',
+              1,
+              [{ subject: 'w1', description: 'worker one', owner: 'worker-1' }],
+              cwd,
+            ));
+          runtimeTeamName = runtime.teamName;
+
+          const workerStatus = await readWorkerStatus(runtime.teamName, 'worker-1', cwd);
+          assert.equal(workerStatus.state, 'unknown');
+          assert.equal(workerStatus.reason, undefined);
+
+          const requests = await listDispatchRequests(runtime.teamName, cwd, { kind: 'inbox' });
+          assert.equal(requests.at(-1)?.status, 'notified');
+
+          const captureCount = Number.parseInt(await readFile(join(cwd, 'capture-count'), 'utf-8'), 10);
+          assert.ok(captureCount >= 2, `expected ready wait capture after bootstrapping, got ${captureCount}`);
+
+          const timing = JSON.parse(
+            await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'startup-timing.json'), 'utf-8'),
+          ) as { events: Array<{ phase: string; ok?: boolean }> };
+          assert.ok(timing.events.some((event) => event.phase === 'ready_wait_start'));
+          assert.ok(timing.events.some((event) => event.phase === 'ready_wait_end' && event.ok === true));
+        },
+      );
+    } finally {
+      if (receiptNotifier) clearInterval(receiptNotifier);
+      if (runtimeTeamName) await shutdownTeam(runtimeTeamName, cwd, { force: true }).catch(() => {});
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousReadyTimeout === 'string') process.env.OMX_TEAM_READY_TIMEOUT_MS = previousReadyTimeout;
+      else delete process.env.OMX_TEAM_READY_TIMEOUT_MS;
+      if (typeof previousStartupEvidenceTimeout === 'string') {
+        process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      }
+      if (typeof previousStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam starts worker-2 readiness before delayed worker-1 readiness settles', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-parallel-ready-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousReadyTimeout = process.env.OMX_TEAM_READY_TIMEOUT_MS;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    let receiptDeliverer: NodeJS.Timeout | null = null;
+    let runtimeTeamName: string | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-parallel-ready-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+order_file="${cwd}/ready-order.log"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 4242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
+      *"-t %2"*"#{pane_pid}"*) echo "4242" ;;
+      *"-t %3"*"#{pane_pid}"*) echo "4343" ;;
+      *"#{pane_pid}"*) echo "4141" ;;
+      *) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    case "$*" in
+      *"-t %2"*)
+        printf '%s\n' w1-ready-start >> "$order_file"
+        sleep 0.4
+        printf '%s\n' w1-ready-done >> "$order_file"
+        printf 'OpenAI Codex\nmodel: test\n› \n'
+        ;;
+      *"-t %3"*)
+        printf '%s\n' w2-ready-start >> "$order_file"
+        printf 'OpenAI Codex\nmodel: test\n› \n'
+        ;;
+      *)
+        printf 'OpenAI Codex\nmodel: test\n› \n'
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    count_file="${cwd}/split-window-count"
+    count=0
+    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    case "$count" in
+      1) echo "%2" ;;
+      2) echo "%3" ;;
+      *) echo "%4" ;;
+    esac
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: '#!/usr/bin/env node\nprocess.stdin.resume();\n' }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_READY_TIMEOUT_MS = '2000';
+          process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '50';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+
+          receiptDeliverer = setInterval(() => {
+            void (async () => {
+              await markPendingInboxDispatchesDelivered('team-parallel-ready', cwd);
+            })();
+          }, 20);
+
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-parallel-ready',
+              'worker-2 readiness should not wait for worker-1 readiness settle',
+              'executor',
+              2,
+              [
+                { subject: 'w1', description: 'worker one', owner: 'worker-1' },
+                { subject: 'w2', description: 'worker two', owner: 'worker-2' },
+              ],
+              cwd,
+            ));
+          runtimeTeamName = runtime.teamName;
+
+          const order = (await readFile(join(cwd, 'ready-order.log'), 'utf-8')).trim().split('\n');
+          assert.ok(order.includes('w1-ready-start'));
+          assert.ok(order.includes('w2-ready-start'));
+          assert.ok(order.includes('w1-ready-done'));
+          assert.equal(
+            order.indexOf('w2-ready-start') < order.indexOf('w1-ready-done'),
+            true,
+            `expected worker-2 readiness attempt before worker-1 readiness settled, got ${order.join(',')}`,
+          );
+        },
+      );
+    } finally {
+      if (receiptDeliverer) clearInterval(receiptDeliverer);
+      if (runtimeTeamName) await shutdownTeam(runtimeTeamName, cwd, { force: true }).catch(() => {});
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousReadyTimeout === 'string') process.env.OMX_TEAM_READY_TIMEOUT_MS = previousReadyTimeout;
+      else delete process.env.OMX_TEAM_READY_TIMEOUT_MS;
+      if (typeof previousStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      if (typeof previousStartupDispatchRetries === 'string') process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      else delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'startTeam records recoverable startup issues per worker instead of failing launch early when panes stay alive',
+    { skip: skipSlowLifecycleUnderCoverage },
+    async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-no-startup-evidence-'));
     const previousTmux = process.env.TMUX;
     const previousTmuxPane = process.env.TMUX_PANE;
@@ -1335,6 +2374,9 @@ esac
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const previousSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
     const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const previousStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+    let receiptFailer: NodeJS.Timeout | null = null;
     let runtime: TeamRuntime | null = null;
     const teamName = 'team-no-startup-evidence';
 
@@ -1421,6 +2463,25 @@ process.on('SIGTERM', () => process.exit(0));
           process.env.OMX_TEAM_WORKER_CLI = 'codex';
           process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
           process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+
+          receiptFailer = setInterval(() => {
+            void (async () => {
+              const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
+              for (const request of requests) {
+                if (request.status !== 'pending') continue;
+                await transitionDispatchRequest(
+                  teamName,
+                  request.request_id,
+                  'pending',
+                  'failed',
+                  { last_reason: 'test_failed_receipt' },
+                  cwd,
+                ).catch(() => {});
+              }
+            })();
+          }, 20);
 
           runtime = await withoutTeamWorkerEnv(() =>
             startTeam(
@@ -1435,20 +2496,22 @@ process.on('SIGTERM', () => process.exit(0));
               cwd,
             ));
 
-          const worker1Status = await readWorkerStatus(teamName, 'worker-1', cwd);
-          const worker2Status = await readWorkerStatus(teamName, 'worker-2', cwd);
+          const runtimeTeamName = runtime.teamName;
+          const worker1Status = await readWorkerStatus(runtimeTeamName, 'worker-1', cwd);
+          const worker2Status = await readWorkerStatus(runtimeTeamName, 'worker-2', cwd);
           assert.equal(worker1Status.state, 'unknown');
           assert.equal(worker2Status.state, 'unknown');
           assert.match(worker1Status.reason ?? '', /startup_no_evidence|fallback_attempted_but_unconfirmed/);
           assert.match(worker2Status.reason ?? '', /startup_no_evidence|fallback_attempted_but_unconfirmed/);
 
-          const task1 = await readTask(teamName, '1', cwd);
-          const task2 = await readTask(teamName, '2', cwd);
+          const task1 = await readTask(runtimeTeamName, '1', cwd);
+          const task2 = await readTask(runtimeTeamName, '2', cwd);
           assert.equal(task1?.status, 'pending');
           assert.equal(task2?.status, 'pending');
         },
       );
     } finally {
+      if (receiptFailer) clearInterval(receiptFailer);
       if (runtime) {
         await shutdownTeam(teamName, cwd, { force: true }).catch(() => {});
       }
@@ -1467,8 +2530,190 @@ process.on('SIGTERM', () => process.exit(0));
       } else {
         delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
       }
+      if (typeof previousStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof previousStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = previousStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+      }
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it(
+    'startTeam attempts worker-2 before rejecting lowest-index unrecoverable startup failure',
+    { skip: skipSlowLifecycleUnderCoverage },
+    async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-parallel-dead-pane-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousReadyTimeout = process.env.OMX_TEAM_READY_TIMEOUT_MS;
+    const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    let receiptFailer: NodeJS.Timeout | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-parallel-dead-pane-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+order_file="${cwd}/dead-pane-order.log"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"-t %2"*"#{pane_dead} #{pane_pid}"*) echo "1 4242" ;;
+      *"-t %3"*"#{pane_dead} #{pane_pid}"*) echo "0 4343" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 4141" ;;
+      *"-t %2"*"#{pane_pid}"*) echo "4242" ;;
+      *"-t %3"*"#{pane_pid}"*) echo "4343" ;;
+      *"#{pane_pid}"*) echo "4141" ;;
+      *) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    case "$*" in
+      *"-t %2"*) printf '%s\n' w1-ready-start >> "$order_file" ;;
+      *"-t %3"*) printf '%s\n' w2-ready-start >> "$order_file"; printf 'OpenAI Codex\nmodel: test\n› \n' ;;
+      *) printf 'OpenAI Codex\nmodel: test\n› \n' ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    count_file="${cwd}/split-window-count"
+    count=0
+    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    case "$count" in
+      1) echo "%2" ;;
+      2) echo "%3" ;;
+      *) echo "%4" ;;
+    esac
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: '#!/usr/bin/env node\nprocess.stdin.resume();\n' }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_READY_TIMEOUT_MS = '300';
+          process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '50';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+
+          receiptFailer = setInterval(() => {
+            void (async () => {
+              const requests = await listDispatchRequests('team-parallel-dead-pane', cwd, { kind: 'inbox' }).catch(() => []);
+              for (const request of requests) {
+                if (request.status !== 'pending') continue;
+                await transitionDispatchRequest(
+                  'team-parallel-dead-pane',
+                  request.request_id,
+                  'pending',
+                  'failed',
+                  { last_reason: 'test_failed_receipt' },
+                  cwd,
+                ).catch(() => {});
+              }
+            })();
+          }, 20);
+
+          await assert.rejects(
+            () => withoutTeamWorkerEnv(() =>
+              startTeam(
+                'team-parallel-dead-pane',
+                'worker-2 should be attempted despite worker-1 fatal readiness failure',
+                'executor',
+                2,
+                [
+                  { subject: 'w1', description: 'worker one', owner: 'worker-1' },
+                  { subject: 'w2', description: 'worker two', owner: 'worker-2' },
+                ],
+                cwd,
+              )),
+            /Worker worker-1 did not become ready/,
+          );
+
+          const order = (await readFile(join(cwd, 'dead-pane-order.log'), 'utf-8')).trim().split('\n');
+          assert.ok(order.includes('w1-ready-start'));
+          assert.ok(order.includes('w2-ready-start'));
+        },
+      );
+    } finally {
+      if (receiptFailer) clearInterval(receiptFailer);
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousReadyTimeout === 'string') process.env.OMX_TEAM_READY_TIMEOUT_MS = previousReadyTimeout;
+      else delete process.env.OMX_TEAM_READY_TIMEOUT_MS;
+      if (typeof previousStartupEvidenceTimeout === 'string') process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
+      else delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      if (typeof previousStartupDispatchRetries === 'string') process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      else delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('settleStartupAttemptResults waits for sibling startup attempt to settle after worker startup throw', async () => {
+    let worker2Settled = false;
+    const startupAttemptResults = await settleStartupAttemptResults([
+      {
+        workerIndex: 1,
+        workerName: 'worker-1',
+        attempt: Promise.reject(new Error('test_startup_attempt_throw:worker-1')),
+      },
+      {
+        workerIndex: 2,
+        workerName: 'worker-2',
+        attempt: new Promise((resolve) => {
+          setTimeout(() => {
+            worker2Settled = true;
+            resolve({ ok: true, workerIndex: 2, workerName: 'worker-2' });
+          }, 100);
+        }),
+      },
+    ]);
+
+    assert.equal(worker2Settled, true, 'worker-2 startup attempt should settle before results return');
+    const firstStartupError = startupAttemptResults
+      .filter((result): result is Extract<typeof result, { ok: false }> => !result.ok)
+      .sort((a, b) => a.workerIndex - b.workerIndex)[0];
+    assert.equal(firstStartupError?.workerName, 'worker-1');
+    assert.match(String(firstStartupError?.error), /test_startup_attempt_throw:worker-1/);
   });
 
   it('startTeam still fails startup when the worker pane is dead/unrecoverable', async () => {
@@ -1477,7 +2722,10 @@ process.on('SIGTERM', () => process.exit(0));
     const previousTmuxPane = process.env.TMUX_PANE;
     const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousReadyTimeout = process.env.OMX_TEAM_READY_TIMEOUT_MS;
     const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const previousStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
 
     try {
       await withMockTmuxFixture(
@@ -1539,7 +2787,10 @@ esac
           process.env.TMUX_PANE = '%1';
           process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
           process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_READY_TIMEOUT_MS = '5000';
           process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
 
           await assert.rejects(
             () => withoutTeamWorkerEnv(() =>
@@ -1564,16 +2815,34 @@ esac
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousReadyTimeout === 'string') {
+        process.env.OMX_TEAM_READY_TIMEOUT_MS = previousReadyTimeout;
+      } else {
+        delete process.env.OMX_TEAM_READY_TIMEOUT_MS;
+      }
       if (typeof previousStartupEvidenceTimeout === 'string') {
         process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
       } else {
         delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
       }
+      if (typeof previousStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof previousStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = previousStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('startTeam materializes all worker identity/inbox files before worker-1 startup evidence can block later workers', async () => {
+  it(
+    'startTeam materializes all worker identity/inbox files before worker-1 startup evidence can block later workers',
+    { skip: skipSlowLifecycleUnderCoverage },
+    async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-materialize-before-evidence-'));
     const previousTmux = process.env.TMUX;
     const previousTmuxPane = process.env.TMUX_PANE;
@@ -1581,6 +2850,9 @@ esac
     const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const previousSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
     const previousStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const previousStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const previousStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+    let receiptFailer: NodeJS.Timeout | null = null;
 
     try {
       await withMockTmuxFixture(
@@ -1670,13 +2942,34 @@ process.on('SIGTERM', () => process.exit(0));
           ],
         },
         async () => {
-          const sanitizedTeamName = sanitizeTeamName('team-materialize-before-evidence');
+          let runtimeTeamName = sanitizeTeamName('team-materialize-before-evidence');
           delete process.env.TMUX;
           process.env.TMUX_PANE = '%1';
           process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
           process.env.OMX_TEAM_WORKER_CLI = 'codex';
           process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
           process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+
+          receiptFailer = setInterval(() => {
+            void (async () => {
+              const activeTeamName = await resolveRuntimeTeamName(cwd, 'team-materialize-before-evidence');
+              runtimeTeamName = activeTeamName;
+              const requests = await listDispatchRequests(activeTeamName, cwd, { kind: 'inbox' }).catch(() => []);
+              for (const request of requests) {
+                if (request.status !== 'pending') continue;
+                await transitionDispatchRequest(
+                  activeTeamName,
+                  request.request_id,
+                  'pending',
+                  'failed',
+                  { last_reason: 'test_failed_receipt' },
+                  cwd,
+                ).catch(() => {});
+              }
+            })();
+          }, 20);
 
           const teamPromise = withoutTeamWorkerEnv(() =>
             startTeam(
@@ -1695,12 +2988,12 @@ process.on('SIGTERM', () => process.exit(0));
             (error: unknown) => ({ ok: false as const, error }),
           );
 
-          const workerOneIdentity = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-1', 'identity.json');
-          const workerTwoIdentity = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-2', 'identity.json');
-          const workerTwoInbox = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-2', 'inbox.md');
-
           let materializedAllWorkers = false;
-          for (let attempt = 0; attempt < 450; attempt += 1) {
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-materialize-before-evidence');
+            const workerOneIdentity = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-1', 'identity.json');
+            const workerTwoIdentity = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-2', 'identity.json');
+            const workerTwoInbox = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-2', 'inbox.md');
             if (
               existsSync(workerOneIdentity)
               && existsSync(workerTwoIdentity)
@@ -1709,7 +3002,7 @@ process.on('SIGTERM', () => process.exit(0));
               materializedAllWorkers = true;
               break;
             }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            await new Promise((resolve) => setTimeout(resolve, 25));
           }
 
           assert.equal(
@@ -1723,12 +3016,13 @@ process.on('SIGTERM', () => process.exit(0));
           assert.match(String((outcome as { ok: false; error: Error }).error), /worker_notify_failed:worker-1/);
 
           assert.equal(
-            existsSync(join(cwd, '.omx', 'state', 'team', sanitizedTeamName)),
+            existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
             false,
           );
         },
       );
     } finally {
+      if (receiptFailer) clearInterval(receiptFailer);
       if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
       else delete process.env.TMUX;
       if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
@@ -1743,6 +3037,16 @@ process.on('SIGTERM', () => process.exit(0));
         process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = previousStartupEvidenceTimeout;
       } else {
         delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      }
+      if (typeof previousStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = previousStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof previousStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = previousStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
       }
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1779,6 +3083,82 @@ process.on('SIGTERM', () => process.exit(0));
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam runs worker MCP orphan cleanup before prompt worker spawn', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-mcp-cleanup-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    const capturePath = join(cwd, 'prompt-cleanup-order.jsonl');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `const capturePath = process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH;
+if (capturePath) require('fs').appendFileSync(capturePath, 'spawn' + String.fromCharCode(10));
+setTimeout(() => {}, 5000);`,
+    );
+
+    const prevPath = process.env.PATH;
+    const prevTmux = process.env.TMUX;
+    const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevLaunchArgs = process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
+    const prevCapture = process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH;
+    const prevAllowNonTty = process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT;
+    let runtime: TeamRuntime | null = null;
+
+    try {
+      process.env.PATH = `${binDir}:${prevPath ?? ''}`;
+      delete process.env.TMUX;
+      process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
+      process.env.OMX_TEAM_WORKER_CLI = 'codex';
+      process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = `--config ${JSON.stringify(`model_instructions_file=\"${join(cwd, 'AGENTS.md')}\"`)}`;
+      process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH = capturePath;
+      process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT = '1';
+
+      const started = await withoutTeamWorkerEnv(() =>
+        startTeam(
+          'team-prompt-cleanup',
+          'prompt cleanup before worker spawn',
+          'executor',
+          1,
+          [{ subject: 's', description: 'd', owner: 'worker-1' }],
+          cwd,
+          {
+            cleanupLaunchOrphanedMcpProcesses: async () => {
+              await writeFile(capturePath, 'cleanup\n', 'utf-8');
+              return { dryRun: false, candidates: [], terminatedCount: 0, forceKilledCount: 0, failedPids: [] };
+            },
+          },
+        ),
+      );
+      runtime = started;
+
+      const order = await waitForFileText(capturePath, (content) => /spawn/.test(content));
+      assert.equal(order, 'cleanup\nspawn\n');
+
+      await shutdownTeam(runtime.teamName, cwd, { force: true });
+      runtime = null;
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevLaunchArgs === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = prevLaunchArgs;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
+      if (typeof prevCapture === 'string') process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH = prevCapture;
+      else delete process.env.OMX_PROMPT_CLEANUP_CAPTURE_PATH;
+      if (typeof prevAllowNonTty === 'string') process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT = prevAllowNonTty;
+      else delete process.env.OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT;
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 
@@ -1828,7 +3208,7 @@ sleep 5
 
       const expectedArgv = [
         '-i',
-        'Read .omx/state/team/team-gemini-prompt/workers/worker-1/inbox.md, start work now, report concrete progress, then continue assigned work or next feasible task.',
+        `Read .omx/state/team/${runtime.teamName}/workers/worker-1/inbox.md, start work now, report concrete progress, then continue assigned work or next feasible task.`,
       ];
       let argv: string[] | null = null;
       for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -1920,7 +3300,7 @@ process.exit(0);
   });
 
 
-  it('startTeam preserves routed task roles into team state and worker launch args', async () => {
+  it('startTeam preserves routed task roles into team state and override-aware worker launch args', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-role-routing-'));
     const binDir = join(cwd, 'bin');
     const fakeCodexPath = join(binDir, 'codex');
@@ -1951,28 +3331,40 @@ process.on('SIGTERM', () => process.exit(0));
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const prevCaptureDir = process.env.OMX_ARGV_CAPTURE_DIR;
+    const prevStandardModel = process.env.OMX_DEFAULT_STANDARD_MODEL;
 
     process.env.PATH = `${binDir}:${prevPath ?? ''}`;
     delete process.env.TMUX;
     process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
     process.env.OMX_TEAM_WORKER_CLI = 'codex';
     process.env.OMX_ARGV_CAPTURE_DIR = captureDir;
+    delete process.env.OMX_DEFAULT_STANDARD_MODEL;
 
     let runtime: TeamRuntime | null = null;
     try {
-      runtime = await withMockPromptModeCodexAllowed(() =>
-        withoutTeamWorkerEnv(() =>
-          startTeam(
-            'team-role-routing',
-            'heuristic routing handoff',
-            'executor',
-            2,
-            [
-              { subject: 'test routing report only', description: 'test routing report only', owner: 'worker-1', role: 'test-engineer' },
-              { subject: 'document routing report only', description: 'document routing report only', owner: 'worker-2', role: 'writer' },
-            ],
-            cwd,
-          )));
+      runtime = await withIsolatedDefaultModelEnvAsync(async () => {
+        assert.ok(process.env.CODEX_HOME, 'isolated CODEX_HOME should be set');
+        await mkdir(process.env.CODEX_HOME, { recursive: true });
+        await writeFile(join(process.env.CODEX_HOME, '.omx-config.json'), JSON.stringify({
+          agentReasoning: {
+            writer: 'xhigh',
+          },
+        }));
+
+        return await withMockPromptModeCodexAllowed(() =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-role-routing',
+              'heuristic routing handoff',
+              'executor',
+              2,
+              [
+                { subject: 'test routing report only', description: 'test routing report only', owner: 'worker-1', role: 'test-engineer' },
+                { subject: 'document routing report only', description: 'document routing report only', owner: 'worker-2', role: 'writer' },
+              ],
+              cwd,
+            )));
+      });
 
       assert.equal(runtime.config.worker_launch_mode, 'prompt');
       assert.equal(runtime.config.workers[0]?.role, 'test-engineer');
@@ -1994,8 +3386,8 @@ process.on('SIGTERM', () => process.exit(0));
       assert.doesNotMatch(worker1Instructions, /exact gpt-5\.4-mini model/);
       assert.match(worker2Instructions, /You are operating as the \*\*writer\*\* role/);
       assert.match(worker2Instructions, /You are Writer\./);
-      assert.match(worker2Instructions, /exact gpt-5\.4-mini model/);
-      assert.match(worker2Instructions, /strict execution order: inspect -> plan -> act -> verify/);
+      assert.doesNotMatch(worker2Instructions, /exact gpt-5\.4-mini model/);
+      assert.match(worker2Instructions, /resolved_model: gpt-5\.5/);
 
       let worker1Args: string[] | null = null;
       let worker2Args: string[] | null = null;
@@ -2016,10 +3408,10 @@ process.on('SIGTERM', () => process.exit(0));
       const worker2Joined = worker2Args!.join(' ');
       assert.match(worker1Joined, /model_reasoning_effort="medium"/);
       assert.match(worker1Joined, /model_instructions_file=.*worker-1\/AGENTS\.md/);
-      assert.match(worker1Joined, /--model gpt-5\.4/);
-      assert.match(worker2Joined, /model_reasoning_effort="high"/);
+      assert.match(worker1Joined, /--model gpt-5\.5/);
+      assert.match(worker2Joined, /model_reasoning_effort="xhigh"/);
       assert.match(worker2Joined, /model_instructions_file=.*worker-2\/AGENTS\.md/);
-      assert.match(worker2Joined, /--model gpt-5\.4-mini/);
+      assert.match(worker2Joined, /--model gpt-5\.5/);
 
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
@@ -2037,6 +3429,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_CLI;
       if (typeof prevCaptureDir === 'string') process.env.OMX_ARGV_CAPTURE_DIR = prevCaptureDir;
       else delete process.env.OMX_ARGV_CAPTURE_DIR;
+      if (typeof prevStandardModel === 'string') process.env.OMX_DEFAULT_STANDARD_MODEL = prevStandardModel;
+      else delete process.env.OMX_DEFAULT_STANDARD_MODEL;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -2072,12 +3466,14 @@ process.on('SIGTERM', () => process.exit(0));
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     const prevCaptureDir = process.env.OMX_ARGV_CAPTURE_DIR;
     const prevLaunchArgs = process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
+    const prevStandardModel = process.env.OMX_DEFAULT_STANDARD_MODEL;
 
     process.env.PATH = `${binDir}:${prevPath ?? ''}`;
     delete process.env.TMUX;
     process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
     process.env.OMX_TEAM_WORKER_CLI = 'codex';
     process.env.OMX_ARGV_CAPTURE_DIR = captureDir;
+    delete process.env.OMX_DEFAULT_STANDARD_MODEL;
     process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = '--model gpt-5.4-mini-tuned';
 
     let runtime: TeamRuntime | null = null;
@@ -2132,6 +3528,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_CLI;
       if (typeof prevCaptureDir === 'string') process.env.OMX_ARGV_CAPTURE_DIR = prevCaptureDir;
       else delete process.env.OMX_ARGV_CAPTURE_DIR;
+      if (typeof prevStandardModel === 'string') process.env.OMX_DEFAULT_STANDARD_MODEL = prevStandardModel;
+      else delete process.env.OMX_DEFAULT_STANDARD_MODEL;
       if (typeof prevLaunchArgs === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = prevLaunchArgs;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
       await rm(cwd, { recursive: true, force: true });
@@ -2388,7 +3786,7 @@ process.on('SIGTERM', () => process.exit(0));
       assert.notEqual(workerPath, repo);
       const workerAgents = await readFile(join(workerPath as string, 'AGENTS.md'), 'utf-8');
       assert.match(workerAgents, /Team Worker Runtime Instructions/);
-      assert.match(workerAgents, /team-detached-worktree-paths/);
+      assert.match(workerAgents, new RegExp(runtime.teamName));
 
       const startupLog = await waitForFileText(
         stdinLogPath,
@@ -2396,11 +3794,11 @@ process.on('SIGTERM', () => process.exit(0));
       );
       assert.match(
         startupLog,
-        /\$OMX_TEAM_STATE_ROOT\/team\/team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/,
+        new RegExp(`\\$OMX_TEAM_STATE_ROOT/team/${runtime.teamName}/workers/worker-1/inbox\\.md`),
       );
       assert.doesNotMatch(
         startupLog,
-        /Read \.omx\/state\/team\/team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/,
+        new RegExp(`Read \\.omx/state/team/${runtime.teamName}/workers/worker-1/inbox\\.md`),
       );
 
       const envLog = JSON.parse(await waitForFileText(envLogPath, (content) => content.includes('teamStateRoot'))) as {
@@ -2413,7 +3811,7 @@ process.on('SIGTERM', () => process.exit(0));
       assert.equal(envLog.worker, 'team-detached-worktree-paths/worker-1');
       const rootAgents = await readFile(join(workerPath, 'AGENTS.md'), 'utf-8');
       assert.match(rootAgents, /Team Worker Runtime Instructions/);
-      assert.match(rootAgents, /Inbox path: .*team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/);
+      assert.match(rootAgents, new RegExp(`Inbox path: .*${runtime.teamName}/workers/worker-1/inbox\\.md`));
 
       await sendWorkerMessage(runtime.teamName, 'leader-fixed', 'worker-1', 'follow-up', repo);
       const mailboxLog = await waitForFileText(
@@ -2422,7 +3820,7 @@ process.on('SIGTERM', () => process.exit(0));
       );
       assert.match(
         mailboxLog,
-        /\$OMX_TEAM_STATE_ROOT\/team\/team-detached-worktree-paths\/mailbox\/worker-1\.json/,
+        new RegExp(`\\$OMX_TEAM_STATE_ROOT/team/${runtime.teamName}/mailbox/worker-1\\.json`),
       );
 
       await shutdownTeam(runtime.teamName, repo, { force: true });
@@ -4650,6 +6048,140 @@ esac
     }
   });
 
+  it('resumeTeam fails closed when the persisted approved binding is stale', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-'));
+    try {
+      await initTeamState('team-approved-resume', 'approved resume test', 'executor', 1, cwd);
+      await writePersistedApprovedTeamExecutionBinding('team-approved-resume', cwd, {
+        prd_path: join(cwd, '.omx', 'plans', 'prd-missing.md'),
+        task: 'Execute missing approved plan',
+      });
+
+      await assert.rejects(
+        () => resumeTeam('team-approved-resume', cwd),
+        /approved_execution_binding_stale:.*Execute missing approved plan/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('resumeTeam fails closed when the persisted approved binding is ambiguous', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-ambiguous-'));
+    const approvedTask = 'Execute approved issue 2111 plan';
+    try {
+      await initTeamState('team-approved-resume', 'approved resume test', 'executor', 1, cwd);
+      await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+      const prdPath = join(cwd, '.omx', 'plans', 'prd-issue-2111.md');
+      await writeFile(
+        prdPath,
+        [
+          '# Approved plan',
+          '',
+          `Launch via omx team 2:executor "${approvedTask}"`,
+          `Launch via omx team 5:debugger "${approvedTask}"`,
+        ].join('\n'),
+      );
+      await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-2111.md'), '# Test spec\n');
+      await writePersistedApprovedTeamExecutionBinding('team-approved-resume', cwd, {
+        prd_path: prdPath,
+        task: approvedTask,
+      });
+
+      await assert.rejects(
+        () => resumeTeam('team-approved-resume', cwd),
+        /approved_execution_binding_ambiguous:.*Execute approved issue 2111 plan/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('resumeTeam fails closed when the persisted approved binding is nonready', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-nonready-'));
+    try {
+      await initTeamState('team-approved-resume', 'approved resume test', 'executor', 1, cwd);
+      await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+      const prdPath = join(cwd, '.omx', 'plans', 'prd-issue-2112.md');
+      await writeFile(
+        prdPath,
+        [
+          '# Approved plan',
+          '',
+          '## Context Pack Outcome',
+          '',
+          '- pack: created `.omx/context/context-20260507T120000Z-other.json`',
+          '',
+          'Launch via omx team 1:executor "Execute approved issue 2112 plan"',
+        ].join('\n'),
+      );
+      await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-2112.md'), '# Test spec\n');
+      await writePersistedApprovedTeamExecutionBinding('team-approved-resume', cwd, {
+        prd_path: prdPath,
+        task: 'Execute approved issue 2112 plan',
+      });
+
+      await assert.rejects(
+        () => resumeTeam('team-approved-resume', cwd),
+        /approved_execution_binding_nonready:invalid:.*Execute approved issue 2112 plan/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('resumeTeam resolves approved binding continuity against the persisted leader cwd', async () => {
+    const teamName = 'team-approved-shared-root';
+    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-leader-'));
+    const resumeCwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-resume-alt-'));
+    const sharedStateRoot = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-state-'));
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    process.env.OMX_TEAM_STATE_ROOT = sharedStateRoot;
+
+    try {
+      await initTeamState(
+        teamName,
+        'approved resume shared-root test',
+        'executor',
+        1,
+        leaderCwd,
+        DEFAULT_MAX_WORKERS,
+        process.env,
+        {
+          leader_cwd: leaderCwd,
+          team_state_root: sharedStateRoot,
+        },
+      );
+      const plansDir = join(leaderCwd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const prdPath = join(plansDir, 'prd-issue-2110.md');
+      await writeFile(
+        prdPath,
+        '# Approved plan\n\nLaunch via omx team 1:executor "Execute approved issue 2110 plan"\n',
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-2110.md'), '# Test spec\n');
+      await writePersistedApprovedTeamExecutionBinding(
+        teamName,
+        leaderCwd,
+        {
+          prd_path: prdPath,
+          task: 'Execute approved issue 2110 plan',
+          command: 'omx team 1:executor "Execute approved issue 2110 plan"',
+        },
+        sharedStateRoot,
+      );
+
+      const resumed = await resumeTeam(teamName, resumeCwd);
+      assert.equal(resumed, null);
+    } finally {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(leaderCwd, { recursive: true, force: true });
+      await rm(resumeCwd, { recursive: true, force: true });
+      await rm(sharedStateRoot, { recursive: true, force: true });
+    }
+  });
+
   it('resumeTeam returns null for prompt teams when worker handles are missing after restart', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-prompt-resume-'));
     const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
@@ -4673,9 +6205,24 @@ esac
       config.workers[0].pid = sleeperPid;
       config.workers[0].pane_id = null;
       await writeFile(configPath, JSON.stringify(config, null, 2));
+      const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-prompt-resume', 'manifest.v2.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as any;
+      manifest.policy.worker_launch_mode = 'prompt';
+      manifest.tmux_session = 'prompt-team-prompt-resume';
+      manifest.leader_pane_id = null;
+      manifest.hud_pane_id = null;
+      manifest.workers[0].pid = sleeperPid;
+      manifest.workers[0].pane_id = null;
+      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       const runtime = await resumeTeam('team-prompt-resume', cwd);
       assert.equal(runtime, null);
+
+      const events = await readTeamEvents('team-prompt-resume', cwd);
+      assert.ok(
+        events.some((event) => event.reason === `prompt_resume_unavailable:missing_handle:worker-1:${sleeperPid}`),
+        'resumeTeam should persist an explicit missing-handle diagnostic event',
+      );
     } finally {
       if (sleeperPid > 0) {
         try {
@@ -4811,6 +6358,451 @@ esac
         () => assignTask('team-approval', 'worker-1', task.id, cwd),
         /plan_approval_required/,
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+
+  it('startTeam persists synthesized delegation plans for broad tasks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-delegation-persist',
+            'delegation persistence test',
+            'executor',
+            1,
+            [{ subject: 'Investigate runtime assignment', description: 'Search runtime and debug assignTask behavior' }],
+            cwd,
+          ),
+        ),
+      );
+
+      const task = await readTask(runtime.teamName, '1', cwd);
+      assert.equal(task?.delegation?.mode, 'auto');
+      assert.equal(task?.delegation?.child_model, 'gpt-5.4-mini');
+      assert.equal(task?.delegation?.required_parallel_probe, true);
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam persists approved execution binding under the team state root', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    const prdPath = join(cwd, '.omx', 'plans', 'prd-issue-1314.md');
+    const testSpecPath = join(cwd, '.omx', 'plans', 'test-spec-issue-1314.md');
+    await writeFile(
+      prdPath,
+      [
+        '# Approved plan',
+        '',
+        buildContextPackOutcome(canonicalContextPackRelativePath('issue-1314')),
+        '',
+        'Launch via omx team 1:executor "Execute approved issue 1314 plan"',
+      ].join('\n'),
+    );
+    await writeFile(testSpecPath, '# Test spec\n');
+    await writeReadyContextPack(cwd, 'issue-1314', prdPath, testSpecPath);
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-approved-binding',
+            'approved binding persistence test',
+            'executor',
+            1,
+            [{ subject: 's', description: 'd', owner: 'worker-1' }],
+            cwd,
+            {
+              approvedExecution: {
+                prd_path: prdPath,
+                task: 'Execute approved issue 1314 plan',
+                command: 'omx team 1:executor "Execute approved issue 1314 plan"',
+              },
+            },
+          ),
+        ),
+      );
+
+      const bindingPath = join(
+        runtime.config.team_state_root ?? join(cwd, '.omx', 'state'),
+        'team',
+        runtime.teamName,
+        'approved-execution.json',
+      );
+      const binding = JSON.parse(await readFile(bindingPath, 'utf-8')) as Record<string, string>;
+      assert.deepEqual(binding, {
+        prd_path: prdPath,
+        task: 'Execute approved issue 1314 plan',
+        command: 'omx team 1:executor "Execute approved issue 1314 plan"',
+      });
+      assert.deepEqual(Object.keys(binding).sort(), ['command', 'prd_path', 'task']);
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam keeps explicit plan-only approved bindings on the generic path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-plan-only-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    await writeFile(
+      join(cwd, '.omx', 'plans', 'prd-issue-1314-plan-only.md'),
+      '# Approved plan\n\nLaunch via omx team 1:executor "Execute approved issue 1314 plan-only"\n',
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1314-plan-only.md'), '# Test spec\n');
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-approved-binding-plan-only',
+            'approved binding generic fallback test',
+            'executor',
+            1,
+            [{ subject: 's', description: 'd', owner: 'worker-1' }],
+            cwd,
+            {
+              approvedExecution: {
+                prd_path: join(cwd, '.omx', 'plans', 'prd-issue-1314-plan-only.md'),
+                task: 'Execute approved issue 1314 plan-only',
+                command: 'omx team 1:executor "Execute approved issue 1314 plan-only"',
+              },
+            },
+          ),
+        ),
+      );
+
+      const bindingPath = join(
+        runtime.config.team_state_root ?? join(cwd, '.omx', 'state'),
+        'team',
+        runtime.teamName,
+        'approved-execution.json',
+      );
+      assert.equal(existsSync(bindingPath), false);
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam fails closed when an explicit approved execution binding is nonready', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-nonready-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    const prdPath = join(cwd, '.omx', 'plans', 'prd-issue-1314-nonready.md');
+    await writeFile(
+      prdPath,
+      [
+        '# Approved plan',
+        '',
+        '## Context Pack Outcome',
+        '',
+        '- pack: created `.omx/context/context-20260507T120000Z-other.json`',
+        '',
+        'Launch via omx team 1:executor "Execute approved issue 1314 nonready plan"',
+      ].join('\n'),
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1314-nonready.md'), '# Test spec\n');
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    try {
+      await assert.rejects(
+        () => withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-approved-binding-nonready',
+              'approved binding nonready start test',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                approvedExecution: {
+                  prd_path: prdPath,
+                  task: 'Execute approved issue 1314 nonready plan',
+                },
+              },
+            ),
+          ),
+        ),
+        /approved_execution_binding_nonready:invalid:.*Execute approved issue 1314 nonready plan/,
+      );
+      assert.equal(
+        existsSync(join(cwd, '.omx', 'state', 'team', 'team-approved-binding-nonready')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam fails closed when an explicit approved execution binding is stale', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-stale-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    const stalePrdPath = join(cwd, '.omx', 'plans', 'prd-issue-1315.md');
+    await writeFile(
+      stalePrdPath,
+      '# Approved plan\n\nLaunch via omx team 1:executor "Execute approved issue 1315 plan"\n',
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1315.md'), '# Test spec\n');
+    await rm(stalePrdPath, { force: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    try {
+      await assert.rejects(
+        () => withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-approved-binding-stale',
+              'approved binding stale start test',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                approvedExecution: {
+                  prd_path: stalePrdPath,
+                  task: 'Execute approved issue 1315 plan',
+                },
+              },
+            ),
+          ),
+        ),
+        /approved_execution_binding_stale:.*Execute approved issue 1315 plan/,
+      );
+      assert.equal(
+        existsSync(join(cwd, '.omx', 'state', 'team', 'team-approved-binding-stale')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam fails closed when an explicit approved execution binding is ambiguous', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-ambiguous-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    const approvedTask = 'Execute approved issue 1316 plan';
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+    const prdPath = join(cwd, '.omx', 'plans', 'prd-issue-1316.md');
+    await writeFile(
+      prdPath,
+      [
+        '# Approved plan',
+        '',
+        `Launch via omx team 2:executor "${approvedTask}"`,
+        `Launch via omx team 5:debugger "${approvedTask}"`,
+      ].join('\n'),
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'test-spec-issue-1316.md'), '# Test spec\n');
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    try {
+      await assert.rejects(
+        () => withPromptModeCodexEnv(binDir, {}, () =>
+          withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-approved-binding-ambiguous',
+              'approved binding ambiguous start test',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+              {
+                approvedExecution: {
+                  prd_path: prdPath,
+                  task: approvedTask,
+                },
+              },
+            ),
+          ),
+        ),
+        /approved_execution_binding_ambiguous:.*Execute approved issue 1316 plan/,
+      );
+      assert.equal(
+        existsSync(join(cwd, '.omx', 'state', 'team', 'team-approved-binding-ambiguous')),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam remaps repo-aware DAG dependencies after concrete task IDs are created', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-dag-remap',
+            'repo-aware DAG remap test',
+            'executor',
+            2,
+            [
+              {
+                subject: 'Implement runtime',
+                description: 'Change runtime',
+                owner: 'worker-1',
+                role: 'executor',
+                symbolic_id: 'impl',
+                symbolic_depends_on: [],
+                lane: 'implementation',
+                filePaths: ['src/team/runtime.ts'],
+                allocation_reason: 'balances current load',
+              },
+              {
+                subject: 'Verify runtime',
+                description: 'Test runtime',
+                owner: 'worker-2',
+                role: 'test-engineer',
+                symbolic_id: 'verify',
+                symbolic_depends_on: ['impl'],
+                lane: 'verification',
+                allocation_reason: 'keeps blocked work on a lighter lane',
+              },
+            ],
+            cwd,
+            {
+              decompositionMetadata: {
+                decomposition_source: 'dag_sidecar',
+                worker_count_requested: 2,
+                worker_count_effective: 2,
+                worker_count_source: 'plan-suggested',
+                ready_lane_count: 1,
+                useful_lane_count: 2,
+                allocation_reasons: {
+                  impl: 'balances current load',
+                  verify: 'keeps blocked work on a lighter lane',
+                },
+                node_dependencies: {
+                  impl: [],
+                  verify: ['impl'],
+                },
+              },
+            },
+          ),
+        ),
+      );
+
+      const first = await readTask(runtime.teamName, '1', cwd);
+      const second = await readTask(runtime.teamName, '2', cwd);
+      assert.deepEqual(first?.depends_on, []);
+      assert.deepEqual(first?.blocked_by, undefined);
+      assert.deepEqual(second?.depends_on, ['1']);
+      assert.deepEqual(second?.blocked_by, ['1']);
+
+      const report = JSON.parse(
+        await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'decomposition-report.json'), 'utf-8'),
+      ) as {
+        node_id_to_task_id?: Record<string, string>;
+        task_hints?: Record<string, { node_id?: string; depends_on?: string[]; symbolic_depends_on?: string[] }>;
+      };
+      assert.deepEqual(report.node_id_to_task_id, { impl: '1', verify: '2' });
+      assert.deepEqual(report.task_hints?.['2']?.depends_on, ['1']);
+      assert.deepEqual(report.task_hints?.['2']?.symbolic_depends_on, ['impl']);
+
+      const inbox = await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-2', 'inbox.md'), 'utf-8');
+      assert.match(inbox, /Blocked by: 1/);
+      assert.doesNotMatch(inbox, /Blocked by: impl/);
+      assert.doesNotMatch(inbox, /Depends on: impl/);
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('assignTask synthesizes delegation before follow-up dispatch rollback', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
+    try {
+      await initTeamState('team-assign-delegation', 'assignment delegation test', 'executor', 1, cwd);
+      const config = await readTeamConfig('team-assign-delegation', cwd);
+      assert.ok(config);
+      config.worker_launch_mode = 'prompt';
+      await saveTeamConfig(config, cwd);
+      const task = await createTask(
+        'team-assign-delegation',
+        { subject: 'Investigate follow-up assignment', description: 'Search repo and debug follow-up assignment behavior', status: 'pending' },
+        cwd,
+      );
+
+      await writeWorkerInbox('team-assign-delegation', 'worker-1', 'existing inbox', cwd);
+      await assert.rejects(
+        () => assignTask('team-assign-delegation', 'worker-1', task.id, cwd),
+        /worker_notify_failed/,
+      );
+
+      const reread = await readTask('team-assign-delegation', task.id, cwd);
+      assert.equal(reread?.delegation?.mode, 'auto');
+      assert.equal(reread?.delegation?.child_model, 'gpt-5.4-mini');
+
+      const inbox = await readFile(join(cwd, '.omx', 'state', 'team', 'team-assign-delegation', 'workers', 'worker-1', 'inbox.md'), 'utf-8');
+      assert.match(inbox, /Assignment Cancelled/);
+      assert.match(inbox, /worker_notify_failed/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -5229,7 +7221,7 @@ esac
     }
   });
 
-  it('sendWorkerMessage transport_direct keeps leader-fixed request pending when leader_pane_id missing', async () => {
+  it('sendWorkerMessage transport_direct fails fast for leader-fixed when leader_pane_id missing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-leader-direct-'));
     try {
       await initTeamState('team-leader-direct', 'leader direct transport test', 'executor', 1, cwd);
@@ -5244,15 +7236,29 @@ esac
       manifest.policy = { ...(manifest.policy || {}), dispatch_mode: 'transport_direct' };
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
-      await sendWorkerMessage('team-leader-direct', 'worker-1', 'leader-fixed', 'hello leader direct', cwd);
+      await assert.rejects(
+        sendWorkerMessage('team-leader-direct', 'worker-1', 'leader-fixed', 'hello leader direct', cwd),
+        /mailbox_notify_failed:leader_pane_missing_transport_direct_failed/,
+      );
 
       const mailbox = await listMailboxMessages('team-leader-direct', 'leader-fixed', cwd);
       assert.ok(mailbox.length >= 1, `expected at least 1 mailbox message, got ${mailbox.length}`);
       const requests = await listDispatchRequests('team-leader-direct', cwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
       assert.ok(requests.length >= 1, `expected at least 1 leader-fixed dispatch request, got ${requests.length}`);
       const latest = requests[requests.length - 1];
-      assert.equal(latest?.status, 'pending');
-      assert.equal(latest?.last_reason, 'leader_pane_missing_deferred');
+      assert.equal(latest?.status, 'failed');
+      assert.equal(latest?.last_reason, 'leader_pane_missing_transport_direct_failed');
+      assert.ok(latest?.failed_at, 'missing leader pane should fail fast with failed_at evidence');
+
+      const deliveryLog = await readTeamDeliveryLog(cwd);
+      const runtimeEntries = deliveryLog.filter((entry) =>
+        entry.event === 'dispatch_result'
+        && entry.source === 'team.runtime'
+        && entry.to_worker === 'leader-fixed'
+        && entry.transport === 'mailbox'
+        && entry.result === 'failed'
+        && entry.reason === 'leader_pane_missing_transport_direct_failed');
+      assert.equal(runtimeEntries.length, 1, 'leader direct missing-pane failure should emit exactly one runtime dispatch_result entry');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -8,7 +8,7 @@
 import { readFile, writeFile, mkdir, unlink, appendFile, rm } from 'fs/promises';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
-import { omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
+import { omxRoot, omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import { getStateFilePath } from '../mcp/state-paths.js';
 
 export interface SessionState {
@@ -20,6 +20,7 @@ export interface SessionState {
   platform?: NodeJS.Platform;
   pid_start_ticks?: number;
   pid_cmdline?: string;
+  tmux_session_name?: string;
 }
 
 const SESSION_FILE = 'session.json';
@@ -65,7 +66,7 @@ async function removeDeadSessionHudState(
  * into a new Codex session.
  */
 export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
-  const omxDir = join(cwd, '.omx');
+  const omxDir = omxRoot(cwd);
   const stateDir = omxStateDir(cwd);
   await mkdir(omxDir, { recursive: true });
   await mkdir(stateDir, { recursive: true });
@@ -158,6 +159,7 @@ interface SessionStartOptions {
   pid?: number;
   platform?: NodeJS.Platform;
   nativeSessionId?: string;
+  tmuxSessionName?: string;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -221,11 +223,15 @@ function createSessionState(
     nowIso?: string;
     nativeSessionId?: string;
     startedAt?: string;
+    tmuxSessionName?: string;
   } = {},
 ): SessionState {
   const nowIso = options.nowIso ?? new Date().toISOString();
   const nativeSessionId = typeof options.nativeSessionId === 'string' && options.nativeSessionId.trim()
     ? options.nativeSessionId.trim()
+    : undefined;
+  const tmuxSessionName = typeof options.tmuxSessionName === 'string' && options.tmuxSessionName.trim()
+    ? options.tmuxSessionName.trim()
     : undefined;
 
   return {
@@ -237,6 +243,7 @@ function createSessionState(
     platform,
     pid_start_ticks: linuxIdentity?.startTicks,
     pid_cmdline: linuxIdentity?.cmdline ?? undefined,
+    ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
   };
 }
 
@@ -293,6 +300,7 @@ export async function writeSessionStart(
     : null;
   const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
     nativeSessionId: options.nativeSessionId,
+    tmuxSessionName: options.tmuxSessionName,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -327,6 +335,16 @@ export async function reconcileNativeSessionStart(
     });
   }
 
+  const existingNativeSessionId = typeof existing.native_session_id === 'string'
+    ? existing.native_session_id.trim()
+    : '';
+  if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
+    return await writeSessionStart(cwd, nativeSessionId, {
+      ...options,
+      nativeSessionId,
+    });
+  }
+
   const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
     ? options.pid
     : process.pid;
@@ -339,6 +357,7 @@ export async function reconcileNativeSessionStart(
     nowIso,
     nativeSessionId,
     startedAt: existing.started_at,
+    tmuxSessionName: existing.tmux_session_name,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -358,37 +377,47 @@ export async function reconcileNativeSessionStart(
 export async function writeSessionEnd(cwd: string, sessionId: string): Promise<void> {
   const state = await readSessionState(cwd);
   const endTime = new Date().toISOString();
+  const ownsCurrentSessionFile = state == null
+    || state.session_id === sessionId
+    || state.native_session_id === sessionId;
 
   // Archive to session history
   const logsDir = omxLogsDir(cwd);
   await mkdir(logsDir, { recursive: true });
 
   const historyEntry = {
-    session_id: state?.session_id || sessionId,
-    ...(state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
-    started_at: state?.started_at || 'unknown',
+    session_id: ownsCurrentSessionFile ? state?.session_id || sessionId : sessionId,
+    ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    started_at: ownsCurrentSessionFile ? state?.started_at || 'unknown' : 'unknown',
     ended_at: endTime,
     cwd,
-    pid: state?.pid || process.pid,
+    pid: ownsCurrentSessionFile ? state?.pid || process.pid : process.pid,
+    ...(!ownsCurrentSessionFile && state?.session_id
+      ? { preserved_active_session_id: state.session_id }
+      : {}),
   };
 
   await appendFile(historyPath(cwd), JSON.stringify(historyEntry) + '\n');
 
   await removeDeadSessionHudState(cwd, [
-    state?.session_id,
-    state?.native_session_id,
+    ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
     sessionId,
   ]);
 
-  // Delete session.json
-  try {
-    await unlink(sessionPath(cwd));
-  } catch { /* already gone */ }
+  // Delete session.json only when this end event owns the current pointer.
+  if (ownsCurrentSessionFile) {
+    try {
+      await unlink(sessionPath(cwd));
+    } catch { /* already gone */ }
+  }
 
   await appendToLog(cwd, {
     event: 'session_end',
-    session_id: state?.session_id || sessionId,
-    ...(state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    session_id: ownsCurrentSessionFile ? state?.session_id || sessionId : sessionId,
+    ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    ...(!ownsCurrentSessionFile && state?.session_id
+      ? { preserved_active_session_id: state.session_id }
+      : {}),
     timestamp: endTime,
   });
 }

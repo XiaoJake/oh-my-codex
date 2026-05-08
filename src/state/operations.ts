@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
   getAllScopedStatePaths,
+  getAuthoritativeActiveStateDirs,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
   getStateDir,
@@ -16,6 +17,7 @@ import {
 } from '../mcp/state-paths.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
+import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
 import {
   SKILL_ACTIVE_STATE_MODE,
   readSkillActiveState,
@@ -34,6 +36,7 @@ export const SUPPORTED_STATE_READ_MODES = [
   'ultraqa',
   'ralplan',
   'deep-interview',
+  'skill-active',
 ] as const;
 
 export type SupportedStateReadMode = (typeof SUPPORTED_STATE_READ_MODES)[number];
@@ -82,6 +85,23 @@ async function writeAtomicFile(path: string, data: string): Promise<void> {
   }
 }
 
+async function writeClearedSessionScopedModeState(
+  path: string,
+  mode: string,
+  sessionId: string,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const clearedState = withModeRuntimeContext({}, {
+    mode,
+    active: false,
+    current_phase: 'cleared',
+    updated_at: nowIso,
+    completed_at: nowIso,
+    session_id: sessionId,
+  });
+  await writeAtomicFile(path, JSON.stringify(clearedState, null, 2));
+}
+
 function readModeSupportsStrictValidation(mode: string): mode is SupportedStateReadMode {
   return SUPPORTED_STATE_READ_MODES.includes(mode as SupportedStateReadMode);
 }
@@ -113,12 +133,27 @@ async function listStateSessionIds(cwd: string): Promise<string[]> {
     .filter((entry) => entry.trim().length > 0);
 }
 
+function hasExplicitStateField(
+  fields: Record<string, unknown>,
+  customState: unknown,
+  key: string,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(fields, key)
+    || (
+      customState != null
+      && Object.prototype.hasOwnProperty.call(customState as Record<string, unknown>, key)
+    );
+}
+
 export async function listStateStatuses(
   cwd: string,
   explicitSessionId?: string,
   mode?: string,
+  options: { authoritativeActiveDecision?: boolean } = {},
 ): Promise<Record<string, unknown>> {
-  const stateDirs = await getReadScopedStateDirs(cwd, explicitSessionId);
+  const stateDirs = options.authoritativeActiveDecision
+    ? await getAuthoritativeActiveStateDirs(cwd, explicitSessionId)
+    : await getReadScopedStateDirs(cwd, explicitSessionId);
   const statuses: Record<string, unknown> = {};
   const seenModes = new Set<string>();
 
@@ -156,7 +191,9 @@ export async function listActiveStateModes(
 ): Promise<string[]> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
   const sessionId = validateSessionId(explicitSessionId);
-  const statuses = await listStateStatuses(cwd, sessionId);
+  const statuses = await listStateStatuses(cwd, sessionId, undefined, {
+    authoritativeActiveDecision: true,
+  });
   return Object.entries(statuses)
     .filter(([, status]) => Boolean((status as { active?: unknown }).active))
     .map(([mode]) => mode);
@@ -180,10 +217,6 @@ export async function executeStateOperation(
   }
 
   try {
-    const stateScope = await resolveStateScope(cwd, explicitSessionId);
-    const effectiveSessionId = stateScope.sessionId;
-    await initializeStateEnvironment(cwd, effectiveSessionId);
-
     switch (name) {
       case 'state_read': {
         const mode = validateStrictReadableMode(rawArgs.mode);
@@ -197,6 +230,10 @@ export async function executeStateOperation(
       }
 
       case 'state_write': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
         const path = getStatePath(mode, cwd, effectiveSessionId);
         const {
@@ -225,6 +262,15 @@ export async function executeStateOperation(
             ...fields,
             ...((customState as Record<string, unknown>) || {}),
           } as Record<string, unknown>;
+          if (!hasExplicitStateField(fields, customState, 'run_outcome')) {
+            delete mergedRaw.run_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'lifecycle_outcome')) {
+            delete mergedRaw.lifecycle_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'terminal_outcome')) {
+            delete mergedRaw.terminal_outcome;
+          }
 
           if (
             mode === 'ralph' &&
@@ -250,6 +296,15 @@ export async function executeStateOperation(
             }
             Object.assign(mergedRaw, validation.state);
             ensureRalphArtifacts = true;
+          }
+
+          if (mode !== SKILL_ACTIVE_STATE_MODE) {
+            const runOutcomeValidation = applyRunOutcomeContract(mergedRaw);
+            if (!runOutcomeValidation.ok || !runOutcomeValidation.state) {
+              validationError = runOutcomeValidation.error || 'Invalid run outcome state';
+              return;
+            }
+            Object.assign(mergedRaw, runOutcomeValidation.state);
           }
 
           if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
@@ -319,12 +374,22 @@ export async function executeStateOperation(
       }
 
       case 'state_clear': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
 
         if (!allSessions) {
           const path = getStatePath(mode, cwd, effectiveSessionId);
-          if (existsSync(path)) {
+          if (
+            mode !== SKILL_ACTIVE_STATE_MODE
+            && effectiveSessionId
+            && existsSync(getStatePath(mode, cwd))
+          ) {
+            await writeClearedSessionScopedModeState(path, mode, effectiveSessionId);
+          } else if (existsSync(path)) {
             await unlink(path);
           }
           if (mode !== SKILL_ACTIVE_STATE_MODE) {

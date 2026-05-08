@@ -11,6 +11,7 @@ import {
   getAllSessionScopedStateDirs,
   getAllSessionScopedStatePaths,
   getReadScopedStateFilePaths,
+  readCurrentSessionId,
   resolveWorkingDirectoryForState,
   getStateDir,
   getStateFilePath,
@@ -60,6 +61,48 @@ describe('validateStateFileName', () => {
 });
 
 describe('state paths', () => {
+  it('uses explicit OMX_TEAM_STATE_ROOT before boxed roots and workingDirectory', () => {
+    const prevRoot = process.env.OMX_ROOT;
+    const prevStateRoot = process.env.OMX_STATE_ROOT;
+    const prevTeamRoot = process.env.OMX_TEAM_STATE_ROOT;
+    process.env.OMX_ROOT = '/tmp/omx-box';
+    process.env.OMX_STATE_ROOT = '/tmp/ignored-state-root';
+    process.env.OMX_TEAM_STATE_ROOT = '/tmp/explicit-team-state';
+    try {
+      assert.equal(getBaseStateDir('/tmp/source'), '/tmp/explicit-team-state');
+      assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1');
+      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1/ralph-state.json');
+    } finally {
+      if (typeof prevRoot === 'string') process.env.OMX_ROOT = prevRoot;
+      else delete process.env.OMX_ROOT;
+      if (typeof prevStateRoot === 'string') process.env.OMX_STATE_ROOT = prevStateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      if (typeof prevTeamRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+    }
+  });
+
+  it('uses OMX_ROOT as boxed workspace root before workingDirectory when no team root is explicit', () => {
+    const prevRoot = process.env.OMX_ROOT;
+    const prevStateRoot = process.env.OMX_STATE_ROOT;
+    const prevTeamRoot = process.env.OMX_TEAM_STATE_ROOT;
+    process.env.OMX_ROOT = '/tmp/omx-box';
+    process.env.OMX_STATE_ROOT = '/tmp/ignored-state-root';
+    delete process.env.OMX_TEAM_STATE_ROOT;
+    try {
+      assert.equal(getBaseStateDir('/tmp/source'), '/tmp/omx-box/.omx/state');
+      assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1');
+      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1/ralph-state.json');
+    } finally {
+      if (typeof prevRoot === 'string') process.env.OMX_ROOT = prevRoot;
+      else delete process.env.OMX_ROOT;
+      if (typeof prevStateRoot === 'string') process.env.OMX_STATE_ROOT = prevStateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      if (typeof prevTeamRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+    }
+  });
+
   it('resolveWorkingDirectoryForState defaults to process.cwd()', () => {
     assert.equal(resolveWorkingDirectoryForState(undefined), process.cwd());
     assert.equal(resolveWorkingDirectoryForState(''), process.cwd());
@@ -222,6 +265,27 @@ describe('state paths', () => {
       });
       assert.deepEqual(paths, [join(stateDir, 'sessions', 'sess-current', 'hud-state.json')]);
     } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers OMX_SESSION_ID over stale session.json when resolving current session id', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-paths-'));
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    try {
+      const stateDir = getBaseStateDir(wd);
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(join(stateDir, 'sessions', 'sess-env'), { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: 'sess-stale',
+        cwd: join(wd, '..', 'other-worktree'),
+      }));
+      process.env.OMX_SESSION_ID = 'sess-env';
+
+      assert.equal(await readCurrentSessionId(wd), 'sess-env');
+    } finally {
+      if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+      else delete process.env.OMX_SESSION_ID;
       await rm(wd, { recursive: true, force: true });
     }
   });

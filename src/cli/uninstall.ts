@@ -10,6 +10,7 @@ import {
   stripOmxEnvSettings,
   stripOmxTopLevelKeys,
   stripOmxFeatureFlags,
+  stripOmxSeededBehavioralDefaults,
 } from "../config/generator.js";
 import {
   parseCodexHooksConfig,
@@ -21,6 +22,7 @@ import { detectLegacySkillRootOverlap } from "../utils/paths.js";
 import { resolveScopeDirectories, type SetupScope } from "./setup.js";
 import { readPersistedSetupScope } from "./index.js";
 import { isOmxGeneratedAgentsMd } from "../utils/agents-md.js";
+import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 
 export interface UninstallOptions {
   dryRun?: boolean;
@@ -46,14 +48,6 @@ interface UninstallSummary {
   legacySkillRootWarning: string | null;
 }
 
-const OMX_MCP_SERVERS = [
-  "omx_state",
-  "omx_memory",
-  "omx_code_intel",
-  "omx_trace",
-  "omx_wiki",
-];
-
 function detectOmxConfigArtifacts(config: string): {
   hasMcpServers: string[];
   hasAgentEntries: number;
@@ -62,7 +56,7 @@ function detectOmxConfigArtifacts(config: string): {
   hasFeatureFlags: boolean;
   hasExploreRoutingEnv: boolean;
 } {
-  const hasMcpServers = OMX_MCP_SERVERS.filter((name) =>
+  const hasMcpServers = OMX_FIRST_PARTY_MCP_SERVER_NAMES.filter((name) =>
     new RegExp(`\\[mcp_servers\\.${name}\\]`).test(config),
   );
 
@@ -87,7 +81,9 @@ function detectOmxConfigArtifacts(config: string): {
   const hasFeatureFlags =
     /^\s*multi_agent\s*=\s*true/m.test(config) ||
     /^\s*child_agents_md\s*=\s*true/m.test(config) ||
-    /^\s*codex_hooks\s*=\s*true/m.test(config);
+    /^\s*codex_hooks\s*=\s*true/m.test(config) ||
+    /^\s*goals\s*=\s*true/m.test(config) ||
+    /^\s*goal\s*=\s*true/m.test(config);
   const hasExploreRoutingEnv = /^\s*USE_OMX_EXPLORE_CMD\s*=/m.test(config);
 
   return {
@@ -144,6 +140,9 @@ async function cleanConfig(
 
   // Strip top-level keys
   config = stripOmxTopLevelKeys(config);
+
+  // Strip OMX-seeded behavioral defaults only when the seeded pair is unchanged.
+  config = stripOmxSeededBehavioralDefaults(config);
 
   // Strip feature flags
   config = stripOmxFeatureFlags(config);
@@ -391,7 +390,7 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
       );
     }
     if (summary.featureFlagsRemoved) {
-      console.log("    Feature flags (multi_agent, child_agents_md, codex_hooks)");
+      console.log("    Feature flags (multi_agent, child_agents_md, codex_hooks, goals)");
     }
   } else if (!summary.configCleaned && summary.mcpServersRemoved.length === 0) {
     console.log("  config.toml: no OMX entries found (or --keep-config used)");

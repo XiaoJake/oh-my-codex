@@ -43,13 +43,14 @@ function buildOmxConfig(): string {
   return [
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -111,16 +112,53 @@ function buildConfigWithSeededModelContext(): string {
   return [
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
-    'model = "gpt-5.4"',
-    'model_context_window = 1000000',
-    'model_auto_compact_token_limit = 900000',
+    'model = "gpt-5.5"',
+    '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)',
+    'model_context_window = 250000',
+    'model_auto_compact_token_limit = 200000',
+    '# End oh-my-codex seeded behavioral defaults',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
+    'goals = true',
+    '',
+    '# ============================================================',
+    '# oh-my-codex (OMX) Configuration',
+    '# Managed by omx setup - manual edits preserved on next setup',
+    '# ============================================================',
+    '',
+    '[mcp_servers.omx_state]',
+    'command = "node"',
+    'args = ["/path/to/state-server.js"]',
+    'enabled = true',
+    '',
+    '# ============================================================',
+    '# End oh-my-codex',
+    '',
+  ].join('\n');
+}
+
+function buildConfigWithEditedSeededModelContext(): string {
+  return [
+    '# oh-my-codex top-level settings (must be before any [table])',
+    'notify = ["node", "/path/to/notify-hook.js"]',
+    'model_reasoning_effort = "medium"',
+    'developer_instructions = "You have oh-my-codex installed."',
+    'model = "gpt-5.5"',
+    '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)',
+    'model_context_window = 123456',
+    'model_auto_compact_token_limit = 200000',
+    '# End oh-my-codex seeded behavioral defaults',
+    '',
+    '[features]',
+    'multi_agent = true',
+    'child_agents_md = true',
+    'codex_hooks = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -145,13 +183,14 @@ function buildMixedConfig(): string {
     '',
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
+    'goals = true',
     'web_search = true',
     '',
     '[mcp_servers.user_custom]',
@@ -341,8 +380,7 @@ describe('omx uninstall', () => {
     }
   });
 
-
-  it('preserves seeded model/context keys during uninstall', async () => {
+  it('removes unchanged OMX-seeded model/context keys during uninstall', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
     try {
       const home = join(wd, 'home');
@@ -355,9 +393,36 @@ describe('omx uninstall', () => {
       assert.equal(res.status, 0, res.stderr || res.stdout);
 
       const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
-      assert.match(config, /^model = "gpt-5\.4"$/m);
-      assert.match(config, /^model_context_window = 1000000$/m);
-      assert.match(config, /^model_auto_compact_token_limit = 900000$/m);
+      assert.match(config, /^model = "gpt-5\.5"$/m);
+      assert.doesNotMatch(config, /^model_context_window = 250000$/m);
+      assert.doesNotMatch(config, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(config, /seeded behavioral defaults/);
+      assert.doesNotMatch(config, /notify\s*=/);
+      assert.doesNotMatch(config, /model_reasoning_effort\s*=/);
+      assert.doesNotMatch(config, /developer_instructions\s*=/);
+      assert.doesNotMatch(config, /oh-my-codex \(OMX\) Configuration/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves user-edited seeded model/context keys during uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(join(codexDir, 'config.toml'), buildConfigWithEditedSeededModelContext());
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
+      assert.match(config, /^model = "gpt-5\.5"$/m);
+      assert.match(config, /^model_context_window = 123456$/m);
+      assert.match(config, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(config, /seeded behavioral defaults/);
       assert.doesNotMatch(config, /notify\s*=/);
       assert.doesNotMatch(config, /model_reasoning_effort\s*=/);
       assert.doesNotMatch(config, /developer_instructions\s*=/);
@@ -473,6 +538,7 @@ describe('omx uninstall', () => {
       assert.match(res.stdout, /TUI status line section/);
       assert.match(res.stdout, /Top-level keys/);
       assert.match(res.stdout, /Feature flags/);
+      assert.match(res.stdout, /goal/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -727,6 +793,8 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
+      'goals = true',
+      'goal = true',
       'web_search = true',
       '',
     ].join('\n');
@@ -734,6 +802,8 @@ describe('stripOmxFeatureFlags', () => {
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /multi_agent/);
     assert.doesNotMatch(result, /child_agents_md/);
+    assert.doesNotMatch(result, /^goals\s*=/m);
+    assert.doesNotMatch(result, /^goal\s*=/m);
     assert.match(result, /web_search = true/);
     assert.match(result, /\[features\]/);
   });
@@ -745,12 +815,14 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
+      'goals = true',
       '',
     ].join('\n');
 
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /\[features\]/);
     assert.doesNotMatch(result, /multi_agent/);
+    assert.doesNotMatch(result, /^goals\s*=/m);
   });
 
   it('handles config without [features] section', async () => {
